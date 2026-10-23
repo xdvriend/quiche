@@ -25,18 +25,30 @@ import pytest
 from numpy.typing import NDArray
 from scipy.linalg import expm
 
-from quiche import estimation as est
-from quiche import simulation as sim
-from quiche.chemistry import get_jw_state
-from quiche.core import Mapping, PauliSum, PauliWord
+from quiche.chemistry import HartreeFockState, get_jw_state
+from quiche.core import (
+    ElectronicHamiltonian,
+    Errors,
+    Mapping,
+    PauliSum,
+    PauliWord,
+    PhaseEstimation,
+    Simulation,
+)
 from quiche.core.qdrift import sample_qdrift_indices
 from quiche.cudaq import CudaqKernel
 from quiche.cudaq.estimation import (
     inverse_qft_kernel,
     iterative_qpe_kernel,
+    measured_circuit_kernel,
     naive_qpe_kernel,
     qubitised_naive_qpe_kernel,
+    qubitised_qpe_circuit,
     qubitised_qpe_kernel,
+    repeated_minimum_kernel,
+    sample_post_processor,
+    textbook_qpe_circuit,
+    textbook_qpe_core,
     textbook_qpe_kernel,
 )
 from quiche.cudaq.simulation import (
@@ -51,9 +63,8 @@ from quiche.cudaq.simulation import (
     trotter_kernel,
 )
 from quiche.cudaq.state_prep import bitstring_kernel
-from quiche.dispatch import Spec
-from quiche.qualtran.bloqs import QDRIFT
-from quiche.state_prep import HartreeFock
+from quiche.dispatch import QPESpec
+from quiche.resources.bloqs import QDRIFT
 
 TIME = 0.7
 ZERO_KET = np.array([1, 0, 0, 0], dtype=complex)  # |00>, big-endian, 2 qubits
@@ -63,7 +74,7 @@ def _pauli_sum(*terms: tuple[float, str], identity: float = 0.0) -> PauliSum:
     """Build a PauliSum from (coeff, dense word) pairs; word index == qubit index."""
     return PauliSum(
         coefficients=tuple(c for c, _ in terms),
-        terms=tuple(PauliWord.from_str(w, big_endian=True) for _, w in terms),
+        words=tuple(PauliWord.from_dense_string(w, big_endian=True) for _, w in terms),
         identity_coefficient=identity,
     )
 
@@ -72,6 +83,8 @@ def _pauli_sum(*terms: tuple[float, str], identity: float = 0.0) -> PauliSum:
 COMMUTING = _pauli_sum((0.5, "ZI"), (0.4, "IZ"), (0.3, "ZZ"), identity=0.2)
 # Non-commuting, for genuine Trotter/QDRIFT convergence checks.
 GENERAL = _pauli_sum((0.7, "XI"), (-0.4, "IZ"), (0.31, "XZ"), identity=-0.2)
+# 1-norm of the non-identity terms, the QDRIFT sampling normalisation.
+GENERAL_LAM = GENERAL.without_identity().lam
 SINGLE = _pauli_sum((-0.6, "XZ"))
 # One qubit narrower than its register, to exercise explicit `n_qubits` padding.
 NARROW = _pauli_sum((1.0, "X"))
@@ -82,7 +95,7 @@ def _big_endian(state: NDArray) -> NDArray[np.complex128]:
     Reindex a CUDA-Q statevector into quiche's qubit-0-most-significant order.
 
     CUDA-Q indexes amplitudes with qubit `b` as bit `b` of the index (qubit 0
-    least significant); `PauliSum._to_matrix` krons qubit 0 first (qubit 0 most
+    least significant); `PauliSum.to_matrix` krons qubit 0 first (qubit 0 most
     significant). Splitting the flat index into one axis per qubit and reversing
     the axis order is exactly that relabelling, and is its own inverse.
     """
@@ -93,7 +106,7 @@ def _big_endian(state: NDArray) -> NDArray[np.complex128]:
 
 def _exact(hamiltonian: PauliSum, time: float, ket: NDArray) -> NDArray[np.complex128]:
     """Compute exp(-i H t)|ket>, in quiche's big-endian basis."""
-    return expm(-1j * time * hamiltonian._to_matrix()) @ ket
+    return expm(-1j * time * hamiltonian.to_matrix()) @ ket
 
 
 def _identity_phase(hamiltonian: PauliSum, time: float) -> complex:
@@ -104,8 +117,8 @@ def _identity_phase(hamiltonian: PauliSum, time: float) -> complex:
 def _reference_pairs(hamiltonian: PauliSum, n_qubits: int) -> list[tuple[float, str]]:
     """Get (coefficient, word) pairs in CUDA-Q's convention, for `_dense_matrix`."""
     pairs = [
-        (c, term.to_str(n_qubits, big_endian=True))
-        for c, term in zip(hamiltonian.coefficients, hamiltonian.terms, strict=True)
+        (c, word.to_dense_string(n_qubits, big_endian=True))
+        for c, word in zip(hamiltonian.coefficients, hamiltonian.words, strict=True)
     ]
     pairs.append((hamiltonian.identity_coefficient, "I" * n_qubits))
     return pairs
@@ -118,7 +131,7 @@ def _dense_matrix(
     Get the dense Pauli-sum matrix in CUDA-Q's own qubit order (qubit 0 = LSB).
 
     A from-scratch port of `cudaq_algorithms`'s own `dense_references.dense_matrix`
-    test helper - not `PauliSum._to_matrix`, which uses the opposite convention.
+    test helper - not `PauliSum.to_matrix`, which uses the opposite convention.
     Kept independent of quiche's production code as a genuine cross-check, used
     only for the Qubitised tests below (block encoding and Walk operate directly
     in CUDA-Q's basis, unlike the Trotter/QDRIFT kernels above which are bridged
@@ -161,7 +174,7 @@ def _run_qpe_on_bitstring(
     """
     Compose `bitstring_kernel` with a `(data: qview) -> float` QPE kernel.
 
-    The canonical composition from `Textbook.to_cudaq`'s docstring: allocate the
+    The canonical composition of state preparation and QPE: allocate the
     data register once, prep it, then run QPE on it - which decodes the energy
     for that shot in-kernel and returns it directly. `cudaq.run` (not
     `cudaq.sample`) collects `shots_count` independent per-shot energies.
@@ -219,14 +232,21 @@ class TestBitstringKernel:
         state = _prepared(cudaq, len(bitstring), bitstring_kernel(bitstring))
         np.testing.assert_allclose(state, np.eye(len(state))[index], atol=1e-12)
 
-    def test_hartree_fock_to_cudaq(self, cudaq: ModuleType):
-        spec = HartreeFock.closed_shell(
-            electrons=2, spin_orbitals=4, mapping=Mapping.JordanWigner
+    def test_hartree_fock_state(self, cudaq: ModuleType, h2: PauliSum, budget: Errors):
+        hf = HartreeFockState.closed_shell(num_electrons=2, num_spin_orbitals=4)
+        spec = QPESpec(
+            hamiltonian=ElectronicHamiltonian(
+                num_electrons=2, mapping=Mapping.JordanWigner, paulis=h2
+            ),
+            state_prep=hf,
+            algorithm=PhaseEstimation.Textbook,
+            simulation=Simulation.Trotter,
+            error_budget=budget,
         )
 
-        state = _prepared(cudaq, 4, spec.to_cudaq())
+        state = _prepared(cudaq, 4, bitstring_kernel(spec._get_stateprep_bitstring()))
 
-        bitstring = get_jw_state(spec.occupation)
+        bitstring = get_jw_state(hf.occupation)
         index = int("".join(str(int(bit)) for bit in bitstring), 2)
         assert np.argmax(np.abs(state)) == index
 
@@ -262,7 +282,7 @@ class TestEvolutionTerms:
         evolution = qdrift_evolution(GENERAL, reps, seed=7)
         assert len(evolution.words) == reps
         assert all(
-            abs(c) == pytest.approx(GENERAL.lam / reps) for c in evolution.coefficients
+            abs(c) == pytest.approx(GENERAL_LAM / reps) for c in evolution.coefficients
         )
 
     def test_qdrift_preserves_duplicate_words(self):
@@ -271,10 +291,10 @@ class TestEvolutionTerms:
         assert qdrift_evolution(SINGLE, reps=4, seed=1).words == ["XZ"] * 4
 
     def test_qdrift_seed_matches_the_qualtran_backend(self):
-        bloq = QDRIFT(h=GENERAL, t=TIME, n_terms=6, seed=7)
+        bloq = QDRIFT(sum=GENERAL, time=TIME, num_samples=6, seed=7)
         expected = [
-            GENERAL.terms[i].to_str(2, big_endian=True)
-            for i in bloq.sample_term_indices()
+            GENERAL.words[i].to_dense_string(2, big_endian=True)
+            for i in bloq.sampled_indices
         ]
         assert qdrift_evolution(GENERAL, reps=6, seed=7).words == expected
 
@@ -297,21 +317,14 @@ class TestQubitisedEncoding:
         # here, so `qubitised_kernel` (unlike `trotter_kernel`/`qdrift_kernel`)
         # needs no separate identity-phase correction.
         encoding = qubitised_encoding(GENERAL)
-        assert encoding.alpha == pytest.approx(
-            GENERAL.lam + abs(GENERAL.identity_coefficient)
-        )
+        assert encoding.alpha == pytest.approx(GENERAL.lam)
 
     def test_num_ancilla(self):
         # GENERAL has 3 non-identity terms plus a nonzero identity coefficient,
         # so PauliLCU retains 4 terms: (4 - 1).bit_length() = 2.
         #
-        # NOTE for whoever wires an ancilla budget to this backend:
-        # get_qubitisation_ancillas's num_index_ancillas = ceil(log2(n_terms))
-        # counts *non-identity* terms only, so it can under-count relative to
-        # what PauliLCU actually allocates whenever the identity coefficient is
-        # nonzero and n_terms is a power of 2 (e.g. 4 non-identity terms + a
-        # nonzero identity coefficient needs 3 ancillas here, not
-        # ceil(log2(4)) = 2) - verified directly against PauliLCU, not assumed.
+        # (This matches get_qubitisation_ancillas's
+        # ceil(log2(num_words_with_identity)), which counts the identity too.)
         assert qubitised_encoding(GENERAL).num_ancilla == 2
 
     def test_register_width_is_pinned(self):
@@ -357,8 +370,8 @@ class TestSimulationKernels:
 
         expected = ZERO_KET
         for index in sample_qdrift_indices(GENERAL, reps, seed):
-            angle = copysign(GENERAL.lam * TIME / reps, GENERAL.coefficients[index])
-            pauli = GENERAL.terms[index]._to_matrix(2, ignore_idle_qubits=False)
+            angle = copysign(GENERAL_LAM * TIME / reps, GENERAL.coefficients[index])
+            pauli = GENERAL.words[index].to_matrix(2, ignore_idle_qubits=False)
             expected = expm(-1j * angle * pauli) @ expected
 
         np.testing.assert_allclose(state, expected, atol=1e-9)
@@ -374,7 +387,7 @@ class TestSimulationKernels:
     def test_qubitised_not_implemented(self):
         # Dispatched before any cudaq import, so this runs without cudaq installed.
         with pytest.raises(NotImplementedError, match="Qubitised"):
-            simulation_kernel(sim.Qubitised(hamiltonian=GENERAL, num_phase_ancillas=2))
+            simulation_kernel(Simulation.Qubitised, GENERAL, TIME, 1)
 
 
 class TestQubitisedKernels:
@@ -518,9 +531,9 @@ class TestInverseQFT:
 class TestTextbookQPEKernel:
     """Real CUDA-Q output on qpp-cpu: Textbook QPE for Trotter and QDRIFT."""
 
-    @pytest.mark.parametrize("method", [sim.Trotter, sim.QDRIFT])
+    @pytest.mark.parametrize("method", [Simulation.Trotter, Simulation.QDRIFT])
     def test_exact_phase_for_single_term_eigenstate(
-        self, cudaq: ModuleType, method: type[sim.Trotter | sim.QDRIFT]
+        self, cudaq: ModuleType, method: Simulation
     ):
         # H = Z, eigenstate |1>: true eigenvalue -1. `time`/`target` are chosen
         # so the true phase lands exactly on a representable bin, making the
@@ -530,15 +543,14 @@ class TestTextbookQPEKernel:
         target = 5
         time = 2 * np.pi * target / (1 << num_qpe_ancillas)
 
-        simulation = method(hamiltonian=h, time=time, reps=1)
-        qpe = textbook_qpe_kernel(simulation, num_qpe_ancillas)
+        qpe = textbook_qpe_kernel(h, method, num_qpe_ancillas, time, reps=1)
         energies = _run_qpe_on_bitstring(cudaq, qpe, (1,), shots_count=20)
 
         np.testing.assert_allclose(energies, -1.0, atol=1e-9)
 
-    @pytest.mark.parametrize("method", [sim.Trotter, sim.QDRIFT])
+    @pytest.mark.parametrize("method", [Simulation.Trotter, Simulation.QDRIFT])
     def test_identity_coefficient_shifts_phase(
-        self, cudaq: ModuleType, method: type[sim.Trotter | sim.QDRIFT]
+        self, cudaq: ModuleType, method: Simulation
     ):
         # H = Z + 0.3*I, eigenstate |1>: true eigenvalue -1 + 0.3 = -0.7. This
         # is the test that would have caught the identity term being
@@ -552,8 +564,7 @@ class TestTextbookQPEKernel:
         target = 11
         time = 2 * np.pi * target / ((1 << num_qpe_ancillas) * (1.0 - 0.3))
 
-        simulation = method(hamiltonian=h, time=time, reps=1)
-        qpe = textbook_qpe_kernel(simulation, num_qpe_ancillas)
+        qpe = textbook_qpe_kernel(h, method, num_qpe_ancillas, time, reps=1)
         energies = _run_qpe_on_bitstring(cudaq, qpe, (1,), shots_count=20)
 
         np.testing.assert_allclose(energies, -0.7, atol=1e-9)
@@ -567,14 +578,15 @@ class TestTextbookQPEKernel:
         # exact tests above) it needs a `cudaq.State`-based entry kernel rather
         # than `bitstring_kernel`.
         h = _pauli_sum((0.6, "X"), (0.4, "Z"))
-        eigvals, eigvecs = np.linalg.eigh(h._to_matrix())
+        eigvals, eigvecs = np.linalg.eigh(h.to_matrix())
         eigenvalue, eigenvector = eigvals[1], eigvecs[:, 1]
 
         num_qpe_ancillas = 8
         time = 0.5
 
-        simulation = sim.Trotter(hamiltonian=h, order=2, time=time, reps=4)
-        qpe = textbook_qpe_kernel(simulation, num_qpe_ancillas)
+        qpe = textbook_qpe_kernel(
+            h, Simulation.Trotter, num_qpe_ancillas, time, reps=4, order=2
+        )
 
         @cudaq.kernel
         def run(state: cudaq.State) -> float:
@@ -592,9 +604,7 @@ class TestTextbookQPEKernel:
     def test_qubitised_not_implemented(self):
         # Dispatched before any cudaq import, so this runs without cudaq installed.
         with pytest.raises(NotImplementedError, match="Qubitised"):
-            textbook_qpe_kernel(
-                sim.Qubitised(hamiltonian=GENERAL, num_phase_ancillas=2), 4
-            )
+            textbook_qpe_kernel(GENERAL, Simulation.Qubitised, 4, TIME, reps=1)
 
 
 class TestQubitisedQPEKernel:
@@ -646,7 +656,7 @@ class TestQubitisedQPEKernel:
         from cudaq_algorithms import sim_utils  # noqa: PLC0415
 
         h = _pauli_sum((0.6, "X"), (0.4, "Z"))
-        eigvals, eigvecs = np.linalg.eigh(h._to_matrix())
+        eigvals, eigvecs = np.linalg.eigh(h.to_matrix())
         eigenvalue, eigenvector = eigvals[1], eigvecs[:, 1]
 
         num_qpe_ancillas = 5
@@ -696,20 +706,17 @@ class TestNaiveQPEKernel:
     where a *statistical* tolerance is unavoidable, not a design choice.
     """
 
-    @pytest.mark.parametrize("method", [sim.Trotter, sim.QDRIFT])
+    @pytest.mark.parametrize("method", [Simulation.Trotter, Simulation.QDRIFT])
     @pytest.mark.parametrize("mode", ["re", "im"])
     def test_matches_exact_expectation_value(
-        self, cudaq: ModuleType, method: type[sim.Trotter | sim.QDRIFT], mode: str
+        self, cudaq: ModuleType, method: Simulation, mode: str
     ):
         h = _pauli_sum((0.6, "X"), (0.4, "Z"), identity=0.2)
         time = 0.5
         shots_count = 4000
 
-        if method is sim.QDRIFT:
-            simulation = sim.QDRIFT(hamiltonian=h, time=time, reps=30, seed=7)
-        else:
-            simulation = sim.Trotter(hamiltonian=h, time=time, reps=5)
-        qpe = naive_qpe_kernel(simulation, mode=mode)
+        reps = 30 if method is Simulation.QDRIFT else 5
+        qpe = naive_qpe_kernel(h, method, time, reps, mode=mode, seed=7)
 
         prep = _prep_theta_kernel(cudaq)
 
@@ -722,7 +729,7 @@ class TestNaiveQPEKernel:
         measured = statistics.mean(cudaq.run(run, shots_count=shots_count))
 
         ket = np.array([np.cos(THETA / 2), np.sin(THETA / 2)], dtype=complex)
-        expectation = ket.conj() @ expm(-1j * time * h._to_matrix()) @ ket
+        expectation = ket.conj() @ expm(-1j * time * h.to_matrix()) @ ket
         expected = expectation.real if mode == "re" else expectation.imag
 
         # Shot-noise tolerance for a +-1-valued estimator: std <= 1, so SEM =
@@ -733,7 +740,7 @@ class TestNaiveQPEKernel:
     def test_qubitised_not_implemented(self):
         # Dispatched before any cudaq import, so this runs without cudaq installed.
         with pytest.raises(NotImplementedError, match="Qubitised"):
-            naive_qpe_kernel(sim.Qubitised(hamiltonian=GENERAL, num_phase_ancillas=2))
+            naive_qpe_kernel(GENERAL, Simulation.Qubitised, TIME, reps=1)
 
 
 class TestQubitisedNaiveQPEKernel:
@@ -782,9 +789,9 @@ class TestIterativeQPEKernel:
     not tolerance-based.
     """
 
-    @pytest.mark.parametrize("method", [sim.Trotter, sim.QDRIFT])
+    @pytest.mark.parametrize("method", [Simulation.Trotter, Simulation.QDRIFT])
     def test_exact_phase_for_single_term_eigenstate(
-        self, cudaq: ModuleType, method: type[sim.Trotter | sim.QDRIFT]
+        self, cudaq: ModuleType, method: Simulation
     ):
         # H = Z, eigenstate |1>: true eigenvalue -1. num_rounds/target chosen
         # so the true phase lands exactly on a representable bin.
@@ -793,15 +800,14 @@ class TestIterativeQPEKernel:
         target = 5
         time = 2 * np.pi * target / (1 << num_rounds)
 
-        simulation = method(hamiltonian=h, time=time, reps=1)
-        qpe = iterative_qpe_kernel(simulation, num_rounds)
+        qpe = iterative_qpe_kernel(h, method, num_rounds, time, reps=1)
         energies = _run_qpe_on_bitstring(cudaq, qpe, (1,), shots_count=20)
 
         np.testing.assert_allclose(energies, -1.0, atol=1e-9)
 
-    @pytest.mark.parametrize("method", [sim.Trotter, sim.QDRIFT])
+    @pytest.mark.parametrize("method", [Simulation.Trotter, Simulation.QDRIFT])
     def test_identity_coefficient_shifts_phase(
-        self, cudaq: ModuleType, method: type[sim.Trotter | sim.QDRIFT]
+        self, cudaq: ModuleType, method: Simulation
     ):
         # H = Z + 0.3*I, eigenstate |1>: true eigenvalue -1+0.3=-0.7 - the test
         # shaped to catch an identity double-count (the combined
@@ -813,8 +819,7 @@ class TestIterativeQPEKernel:
         target = 11
         time = 2 * np.pi * target / ((1 << num_rounds) * (1.0 - 0.3))
 
-        simulation = method(hamiltonian=h, time=time, reps=1)
-        qpe = iterative_qpe_kernel(simulation, num_rounds)
+        qpe = iterative_qpe_kernel(h, method, num_rounds, time, reps=1)
         energies = _run_qpe_on_bitstring(cudaq, qpe, (1,), shots_count=20)
 
         np.testing.assert_allclose(energies, -0.7, atol=1e-9)
@@ -823,13 +828,14 @@ class TestIterativeQPEKernel:
         from cudaq_algorithms import sim_utils  # noqa: PLC0415
 
         h = _pauli_sum((0.6, "X"), (0.4, "Z"))
-        eigvals, eigvecs = np.linalg.eigh(h._to_matrix())
+        eigvals, eigvecs = np.linalg.eigh(h.to_matrix())
         eigenvalue, eigenvector = eigvals[1], eigvecs[:, 1]
 
         num_rounds = 8
         time = 0.5
-        simulation = sim.Trotter(hamiltonian=h, order=2, time=time, reps=4)
-        qpe = iterative_qpe_kernel(simulation, num_rounds)
+        qpe = iterative_qpe_kernel(
+            h, Simulation.Trotter, num_rounds, time, reps=4, order=2
+        )
 
         @cudaq.kernel
         def run(state: cudaq.State) -> float:
@@ -846,135 +852,96 @@ class TestIterativeQPEKernel:
     def test_qubitised_not_implemented(self):
         # Dispatched before any cudaq import, so this runs without cudaq installed.
         with pytest.raises(NotImplementedError, match="Qubitised"):
-            iterative_qpe_kernel(
-                sim.Qubitised(hamiltonian=GENERAL, num_phase_ancillas=2), 4
-            )
+            iterative_qpe_kernel(GENERAL, Simulation.Qubitised, 4, TIME, reps=1)
 
 
-class TestEstimationToCudaq:
-    """`to_cudaq()` wiring across implemented (algorithm, simulation) pairs."""
+# H = Z with time and ancillas placing both eigenvalues exactly on a bin.
+EXACT_NUM_QPE_ANCILLAS = 6
+EXACT_TIME = 2 * np.pi * 5 / (1 << EXACT_NUM_QPE_ANCILLAS)
 
-    @pytest.mark.parametrize(
-        ("algorithm", "method"),
-        [
-            (est.Textbook, sim.Trotter),
-            (est.Textbook, sim.QDRIFT),
-            (est.Textbook, sim.Qubitised),
-            (est.Naive, sim.Trotter),
-            (est.Naive, sim.QDRIFT),
-            (est.Naive, sim.Qubitised),
-            (est.Iterative, sim.Trotter),
-            (est.Iterative, sim.QDRIFT),
-        ],
-    )
-    def test_runs_and_returns_floats(
-        self,
-        cudaq: ModuleType,
-        algorithm: type[est.EstimationMethod],
-        method: type[sim.SimulationMethod],
-    ):
-        h = _pauli_sum((0.6, "X"), (0.4, "Z"))
-        if method is sim.Qubitised:
-            simulation = sim.Qubitised(hamiltonian=h, error=0.5)
-        elif method is sim.QDRIFT:
-            simulation = sim.QDRIFT(hamiltonian=h, reps=20)
-        else:
-            simulation = sim.Trotter(hamiltonian=h, error=0.5)
-        # A looser error for qubitisation keeps its walk ladder short (6 ancillas).
-        error = 4.0 if method is sim.Qubitised else 0.5
-        if algorithm is est.Naive:
-            qpe_method = est.Naive(simulation=simulation)
-        else:
-            qpe_method = algorithm(simulation=simulation, overlap=0.5, error=error)
 
-        prep = bitstring_kernel((0,))
-        qpe = qpe_method.to_cudaq()
-        num_data = qpe_method.num_data
+def _plus_kernel(cudaq: ModuleType) -> CudaqKernel:
+    """Build a `(qubits: qview)` kernel preparing |+> on one qubit."""
 
-        @cudaq.kernel
-        def run() -> float:
-            """Allocate the data register once, prep it, then run QPE on it."""
-            data = cudaq.qvector(num_data)
-            prep(data)
-            return qpe(data)
+    @cudaq.kernel
+    def plus(qubits: cudaq.qview) -> None:
+        h(qubits[0])  # noqa: F821 -- CUDA-Q intrinsic, not a real Python name
 
-        energies = cudaq.run(run, shots_count=20)
-        assert len(energies) == 20
-        assert all(isinstance(energy, float) for energy in energies)
-
-    def test_kitaev_not_implemented(self, h2: PauliSum):
-        qpe = est.Kitaev(
-            simulation=sim.Trotter(hamiltonian=h2, reps=1), overlap=1, num_rounds=6
-        )
-        with pytest.raises(NotImplementedError, match="Kitaev"):
-            qpe.to_cudaq()
-
-    def test_iterative_qubitised_not_implemented(self, h2: PauliSum):
-        qpe = est.Iterative(
-            simulation=sim.Qubitised(hamiltonian=h2, num_phase_ancillas=2),
-            overlap=1,
-            num_rounds=6,
-        )
-        with pytest.raises(NotImplementedError, match="Qubitised"):
-            qpe.to_cudaq()
+    return plus
 
 
 class TestRepeatedMinimum:
-    """`to_cudaq(state_prep)` runs the repeat-and-take-minimum protocol in-kernel."""
+    """`repeated_minimum_kernel` runs the repeat-and-take-minimum protocol in-kernel."""
 
-    def _textbook(self, repetitions: int) -> est.Textbook:
-        # H = Z with time and ancillas placing both eigenvalues exactly on a bin.
-        h = _pauli_sum((1.0, "Z"))
-        time = 2 * np.pi * 5 / (1 << 6)
-        trotter = sim.Trotter(hamiltonian=h, time=time, reps=1)
-        return est.Textbook(
-            simulation=trotter, overlap=0.5, num_ancillas=6, repetitions=repetitions
+    @staticmethod
+    def _repeated(state_prep: CudaqKernel, repetitions: int) -> CudaqKernel:
+        core, work_qubits = textbook_qpe_core(
+            _pauli_sum((1.0, "Z")),
+            Simulation.Trotter,
+            EXACT_NUM_QPE_ANCILLAS,
+            EXACT_TIME,
+            reps=1,
         )
+        return repeated_minimum_kernel(core, work_qubits, state_prep, 1, repetitions)
 
     def test_minimum_finds_ground_state(self, cudaq: ModuleType):
         # |+> has overlap 1/2 with the ground state |1> (E = -1) and 1/2 with |0>
         # (E = +1), so a single run reads +1 half the time; the minimum of 20 runs
         # reads +1 only with probability 2^-20.
-        @cudaq.kernel
-        def plus(qubits: cudaq.qview) -> None:
-            h(qubits[0])  # noqa: F821 -- CUDA-Q intrinsic, not a real Python name
-
-        repeated = self._textbook(repetitions=20).to_cudaq(state_prep=plus)
+        repeated = self._repeated(_plus_kernel(cudaq), repetitions=20)
         energies = cudaq.run(repeated, shots_count=10)
 
         np.testing.assert_allclose(energies, -1.0, atol=1e-9)
 
     def test_single_repetition_matches_single_run(self, cudaq: ModuleType):
-        repeated = self._textbook(repetitions=1).to_cudaq(
-            state_prep=bitstring_kernel((0,))
-        )
+        repeated = self._repeated(bitstring_kernel((0,)), repetitions=1)
         energies = cudaq.run(repeated, shots_count=5)
 
         np.testing.assert_allclose(energies, 1.0, atol=1e-9)
 
-    def test_naive_rejects_state_prep(self):
-        naive = est.Naive(simulation=sim.Trotter(hamiltonian=GENERAL, reps=1))
-        with pytest.raises(ValueError, match="no minimum"):
-            naive.to_cudaq(state_prep=bitstring_kernel((0, 0)))
-
 
 class TestCircuitAndPost:
-    """`to_cudaq(kernel="circuit")` sampled once, decoded by `kernel="post"`."""
+    """`measured_circuit_kernel` sampled once, decoded by `sample_post_processor`."""
 
     @staticmethod
-    def _sample(qpe: est.Textbook, state_prep: CudaqKernel, shots: int) -> list[float]:
-        circuit = qpe.to_cudaq(state_prep, kernel="circuit")
-        post = qpe.to_cudaq(kernel="post")
-        return post(cudaq_sample(circuit, shots * qpe.repetitions))
+    def _sample(  # noqa: PLR0913
+        circuit: tuple[CudaqKernel, int, object],
+        num_qpe_ancillas: int,
+        state_prep: CudaqKernel,
+        shots: int,
+        *,
+        num_data: int = 1,
+        repetitions: int = 1,
+    ) -> list[float]:
+        kernel, work_qubits, decode = circuit
+        measured = measured_circuit_kernel(
+            kernel,
+            work_qubits,
+            num_qpe_ancillas,
+            state_prep=state_prep,
+            num_data=num_data,
+        )
+        post = sample_post_processor(decode, repetitions)
+        return post(cudaq_sample(measured, shots * repetitions))
 
-    @pytest.mark.parametrize("method", [sim.Trotter, sim.QDRIFT])
+    @staticmethod
+    def _plus_circuit() -> tuple[CudaqKernel, int, object]:
+        return textbook_qpe_circuit(
+            _pauli_sum((1.0, "Z")),
+            Simulation.Trotter,
+            EXACT_NUM_QPE_ANCILLAS,
+            EXACT_TIME,
+            reps=1,
+        )
+
+    @pytest.mark.parametrize("method", [Simulation.Trotter, Simulation.QDRIFT])
     @pytest.mark.parametrize(
         ("identity", "target", "expected"), [(0.0, 5, -1.0), (0.3, 11, -0.7)]
     )
     def test_exact_eigenstate(
         self,
         cudaq: ModuleType,  # noqa: ARG002 -- skips without cudaq
-        method: type[sim.Trotter | sim.QDRIFT],
+        method: Simulation,
         identity: float,
         target: int,
         expected: float,
@@ -983,12 +950,8 @@ class TestCircuitAndPost:
         # is not a palindrome in 6 bits, so this also pins the bit order.
         h = _pauli_sum((1.0, "Z"), identity=identity)
         time = 2 * np.pi * target / ((1 << 6) * (1.0 - identity))
-        qpe = est.Textbook(
-            simulation=method(hamiltonian=h, time=time, reps=1),
-            overlap=1,
-            num_ancillas=6,
-        )
-        energies = self._sample(qpe, bitstring_kernel((1,)), shots=20)
+        circuit = textbook_qpe_circuit(h, method, 6, time, reps=1)
+        energies = self._sample(circuit, 6, bitstring_kernel((1,)), shots=20)
         np.testing.assert_allclose(energies, expected, atol=1e-9)
 
     @pytest.mark.parametrize(
@@ -1009,100 +972,205 @@ class TestCircuitAndPost:
     ):
         # The cases of TestQubitisedQPEKernel, via the sampled circuit.
         h = _pauli_sum(*terms, identity=identity)
-        qubitised = sim.Qubitised(hamiltonian=h, num_phase_ancillas=3)
-        qpe = est.Textbook(simulation=qubitised, overlap=1, num_ancillas=5)
-        energies = self._sample(qpe, bitstring_kernel(bits), shots=20)
-        np.testing.assert_allclose(energies, expected, atol=1e-9)
-
-    def _plus_textbook(self, repetitions: int) -> est.Textbook:
-        h = _pauli_sum((1.0, "Z"))
-        time = 2 * np.pi * 5 / (1 << 6)
-        trotter = sim.Trotter(hamiltonian=h, time=time, reps=1)
-        return est.Textbook(
-            simulation=trotter, overlap=0.5, num_ancillas=6, repetitions=repetitions
+        circuit = qubitised_qpe_circuit(h, 3)
+        energies = self._sample(
+            circuit, 3, bitstring_kernel(bits), shots=20, num_data=len(bits)
         )
+        np.testing.assert_allclose(energies, expected, atol=1e-9)
 
     def test_statistics_match_overlap(self, cudaq: ModuleType):
         # |+> reads the ground state (E = -1) or |0> (E = +1), each with probability ½.
-        @cudaq.kernel
-        def plus(qubits: cudaq.qview) -> None:
-            h(qubits[0])  # noqa: F821 -- CUDA-Q intrinsic, not a real Python name
-
         shots = 400
-        energies = np.array(self._sample(self._plus_textbook(1), plus, shots))
+        energies = np.array(
+            self._sample(
+                self._plus_circuit(),
+                EXACT_NUM_QPE_ANCILLAS,
+                _plus_kernel(cudaq),
+                shots,
+            )
+        )
         assert set(np.round(energies, 9)) <= {-1.0, 1.0}
         assert abs(np.mean(energies == -1.0) - 0.5) < 6 * 0.5 / np.sqrt(shots)
 
     def test_minimum_over_repetitions(self, cudaq: ModuleType):
-        @cudaq.kernel
-        def plus(qubits: cudaq.qview) -> None:
-            h(qubits[0])  # noqa: F821 -- CUDA-Q intrinsic, not a real Python name
-
-        energies = self._sample(self._plus_textbook(20), plus, shots=10)
+        energies = self._sample(
+            self._plus_circuit(),
+            EXACT_NUM_QPE_ANCILLAS,
+            _plus_kernel(cudaq),
+            shots=10,
+            repetitions=20,
+        )
         assert len(energies) == 10
         np.testing.assert_allclose(energies, -1.0, atol=1e-9)
 
     def test_post_rejects_partial_block(self):
-        post = self._plus_textbook(3).to_cudaq(kernel="post")
+        _, _, decode = self._plus_circuit()
+        post = sample_post_processor(decode, 3)
         with pytest.raises(ValueError, match="multiple of repetitions=3"):
             post(["000000"] * 4)
 
     def test_post_decodes_bitstrings(self):
         # Character k is ancilla k, weighted 2^k: "101000" reads y = 5.
-        post = self._plus_textbook(1).to_cudaq(kernel="post")
+        _, _, decode = self._plus_circuit()
+        post = sample_post_processor(decode, 1)
         np.testing.assert_allclose(post(["101000"]), -1.0, atol=1e-9)
 
-    def test_post_rejects_state_prep(self):
-        with pytest.raises(ValueError, match="no state_prep"):
-            self._plus_textbook(1).to_cudaq(bitstring_kernel((1,)), kernel="post")
+
+# Commuting, so Trotterisation is exact. In the |q0 = 0, q1 = 1> eigenstate the energy
+# is 0.8 - 0.3 + 0.7 = 1.2, above the non-identity 1-norm 1.1: with t = pi / 1.1 its
+# phase would wrap, whereas QPESpec's t = pi / lam (lam includes the identity, 1.8)
+# keeps it in range.
+WRAP_HAMILTONIAN = _pauli_sum((0.8, "ZI"), (0.3, "IZ"), identity=0.7)
+WRAP_ENERGY = 1.2
+
+
+def _qpe_spec(
+    hamiltonian: PauliSum,
+    algorithm: PhaseEstimation,
+    simulation: Simulation,
+    state_prep: HartreeFockState | None = None,
+    num_electrons: int = 0,
+) -> QPESpec:
+    """Build a QPESpec with a loose error budget, to keep the circuits small."""
+    return QPESpec(
+        hamiltonian=ElectronicHamiltonian(
+            num_electrons=num_electrons,
+            mapping=Mapping.JordanWigner,
+            paulis=hamiltonian,
+        ),
+        state_prep=state_prep,
+        algorithm=algorithm,
+        simulation=simulation,
+        error_budget=Errors(
+            estimation=0.5, simulation=0.5, rotations=0.5, state_prep=0.5, overlap=1
+        ),
+        seed=7,
+    )
+
+
+class TestQPESpecToCudaq:
+    """`QPESpec.to_cudaq()` wiring across implemented (algorithm, simulation) pairs."""
+
+    @pytest.mark.parametrize(
+        ("algorithm", "simulation"),
+        [
+            (PhaseEstimation.Textbook, Simulation.Trotter),
+            (PhaseEstimation.Textbook, Simulation.QDRIFT),
+            (PhaseEstimation.Textbook, Simulation.Qubitised),
+            (PhaseEstimation.Iterative, Simulation.Trotter),
+            (PhaseEstimation.Iterative, Simulation.QDRIFT),
+        ],
+    )
+    def test_runs_and_returns_floats(
+        self,
+        cudaq: ModuleType,
+        algorithm: PhaseEstimation,
+        simulation: Simulation,
+    ):
+        spec = _qpe_spec(_pauli_sum((0.6, "X"), (0.4, "Z")), algorithm, simulation)
+
+        energies = cudaq.run(spec.to_cudaq(), shots_count=20)
+
+        assert len(energies) == 20
+        assert all(isinstance(energy, float) for energy in energies)
+
+    @pytest.mark.parametrize(
+        "algorithm", [PhaseEstimation.Textbook, PhaseEstimation.Iterative]
+    )
+    def test_default_time_does_not_wrap(
+        self, cudaq: ModuleType, algorithm: PhaseEstimation
+    ):
+        assert WRAP_HAMILTONIAN.without_identity().lam < WRAP_ENERGY
+        spec = _qpe_spec(
+            WRAP_HAMILTONIAN,
+            algorithm,
+            Simulation.Trotter,
+            state_prep=HartreeFockState(occupation=(0, 1)),
+            num_electrons=1,
+        )
+
+        energies = cudaq.run(spec.to_cudaq(), shots_count=50)
+
+        num_bits = (
+            spec.num_qpe_ancillas
+            if algorithm == PhaseEstimation.Textbook
+            else spec.num_rounds
+        )
+        bin_width = (2 * np.pi / spec.time) / (1 << num_bits)
+        assert abs(statistics.mode(energies) - WRAP_ENERGY) < bin_width
+
+    def test_circuit_and_post(self, cudaq: ModuleType):  # noqa: ARG002
+        spec = _qpe_spec(
+            WRAP_HAMILTONIAN,
+            PhaseEstimation.Textbook,
+            Simulation.Trotter,
+            state_prep=HartreeFockState(occupation=(0, 1)),
+            num_electrons=1,
+        )
+
+        post = spec.to_cudaq(kernel="post")
+        energies = post(cudaq_sample(spec.to_cudaq(kernel="circuit"), 50))
+
+        bin_width = (2 * np.pi / spec.time) / (1 << spec.num_qpe_ancillas)
+        assert abs(statistics.mode(energies) - WRAP_ENERGY) < bin_width
 
     def test_unknown_kernel(self):
-        textbook = self._plus_textbook(1)
+        spec = _qpe_spec(GENERAL, PhaseEstimation.Textbook, Simulation.Trotter)
         with pytest.raises(ValueError, match="kernel must be"):
-            textbook.to_cudaq(kernel="everything")  # type: ignore[arg-type]
+            spec.to_cudaq(kernel="everything")  # type: ignore[arg-type]
 
     @pytest.mark.parametrize("kernel", ["circuit", "post"])
     def test_iterative_has_no_circuit(self, kernel: str):
-        iterative = est.Iterative(
-            simulation=sim.Trotter(hamiltonian=GENERAL, reps=1), overlap=1, num_rounds=6
-        )
+        spec = _qpe_spec(GENERAL, PhaseEstimation.Iterative, Simulation.Trotter)
         with pytest.raises(ValueError, match="mid-circuit"):
-            iterative.to_cudaq(kernel=kernel)  # type: ignore[arg-type]
+            spec.to_cudaq(kernel=kernel)  # type: ignore[arg-type]
 
-    def test_naive_not_implemented(self):
-        naive = est.Naive(simulation=sim.Trotter(hamiltonian=GENERAL, reps=1))
-        with pytest.raises(NotImplementedError, match="Naive"):
-            naive.to_cudaq(kernel="circuit")
+    @pytest.mark.parametrize(
+        ("algorithm", "simulation", "match"),
+        [
+            (PhaseEstimation.Kitaev, Simulation.Trotter, "Kitaev"),
+            (PhaseEstimation.Naive, Simulation.Trotter, "Naive"),
+            (PhaseEstimation.Iterative, Simulation.Qubitised, "Qubitised"),
+        ],
+    )
+    def test_not_implemented(
+        self, algorithm: PhaseEstimation, simulation: Simulation, match: str
+    ):
+        # Dispatched before any cudaq import, so this runs without cudaq installed.
+        spec = _qpe_spec(GENERAL, algorithm, simulation)
+        with pytest.raises(NotImplementedError, match=match):
+            spec.to_cudaq()
 
 
-class TestDefaultTimeDoesNotWrap:
-    """The default time keeps phases unwrapped even with a large identity term."""
+class TestPauliSumFromCudaq:
+    """Tests for PauliSum.from_cudaq against the real cudaq.SpinOperator."""
 
-    def test_eigenvalue_above_lambda(self, cudaq: ModuleType):
-        from cudaq_algorithms import sim_utils  # noqa: PLC0415
+    def test_from_spin_operator(self, cudaq: ModuleType):
+        spin = cudaq.spin
+        op = 0.5 * spin.z(0) - 0.3 * spin.x(0) * spin.x(1)
 
-        # Eigenvalues are +-1 + 0.7, so the top one, 1.7, exceeds lam = 1.4. With
-        # t = pi / lam its phase would wrap and decode as -1.1; the default
-        # t = pi / (lam + |c_I|) keeps it in range.
-        h = _pauli_sum((0.6, "X"), (0.8, "Z"), identity=0.7)
-        eigvals, eigvecs = np.linalg.eigh(h._to_matrix())
-        eigenvalue, eigenvector = eigvals[1], eigvecs[:, 1]
-        assert eigenvalue > h.lam
+        result = PauliSum.from_cudaq(op)
 
-        trotter = sim.Trotter(hamiltonian=h, reps=10)
-        qpe = est.Textbook(simulation=trotter, overlap=1, num_ancillas=6).to_cudaq()
+        assert result.num_qubits == 2
+        assert result.num_words == 2
+        assert result.identity_coefficient == 0.0
 
-        @cudaq.kernel
-        def run(state: cudaq.State) -> float:
-            """Load the eigenstate, then run QPE on it."""
-            data = cudaq.qvector(state)
-            return qpe(data)
+    def test_from_spin_operator_with_identity(self, cudaq: ModuleType):
+        spin = cudaq.spin
+        op = 1.2 * spin.i(0) + 0.5 * spin.z(0)
 
-        initial_state = sim_utils.state_from(eigenvector.astype(complex))
-        energies = cudaq.run(run, initial_state, shots_count=20)
+        result = PauliSum.from_cudaq(op)
 
-        bin_width = trotter.energy_scale / (1 << 6)
-        assert abs(statistics.mode(energies) - eigenvalue) < bin_width
+        assert result.identity_coefficient == pytest.approx(1.2)
+        assert result.num_words == 1
+
+    def test_from_spin_operator_term(self, cudaq: ModuleType):
+        term = cudaq.spin.y(1)
+
+        result = PauliSum.from_cudaq(term)
+
+        assert result.num_words == 1
+        assert result.words[0].to_dense_string(2, big_endian=True) == "IY"
 
 
 class TestSoftDependency:
@@ -1111,17 +1179,9 @@ class TestSoftDependency:
     def test_import_quiche_does_not_import_cudaq(self):
         # A subprocess, because tests/conftest.py deliberately pre-imports cudaq.
         code = (
-            "import quiche, sys; "
+            "import quiche, quiche.cudaq, quiche.dispatch, sys; "
             "assert 'cudaq' not in sys.modules; "
             "assert 'cudaq_algorithms' not in sys.modules"
         )
         result = subprocess.run([sys.executable, "-c", code], check=False)  # noqa: S603
         assert result.returncode == 0
-
-    def test_spec_requires_to_cudaq(self):
-        class Incomplete(Spec):
-            def to_qualtran(self) -> None: ...
-            def to_quest(self) -> None: ...
-
-        with pytest.raises(TypeError, match="to_cudaq"):
-            Incomplete()

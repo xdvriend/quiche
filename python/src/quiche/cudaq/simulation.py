@@ -15,16 +15,16 @@
 """Hamiltonian-simulation kernels for the CUDA-Q backend."""
 
 # The kernel factories below take many named, optional simulation parameters,
-# matching the equally wide `getPhaseTextbook*` signatures in quiche.quest.estimation.
+# matching the equally wide `getPhaseTextbook*` signatures in
+# quiche.simulation.estimation.
 # ruff: noqa: PLR0913
 
 from math import copysign
 from typing import TYPE_CHECKING
 
-from quiche.core import PauliSum, Seed
+from quiche.core import PauliSum, Seed, Simulation
 from quiche.core.qdrift import sample_qdrift_indices
 from quiche.cudaq._runtime import CudaqKernel, load_cudaq
-from quiche.simulation import QDRIFT, Qubitised, Trotter
 
 if TYPE_CHECKING:
     # cudaq_algorithms is a soft, optional dependency; only imported for real
@@ -53,9 +53,9 @@ def _pauli_pairs(hamiltonian: PauliSum, n_qubits: int) -> list[tuple[float, str]
     width is fixed, so the pad is always safe to append.
     """
     pairs = [
-        (coefficient, term.to_str(n_qubits, big_endian=True))
-        for coefficient, term in zip(
-            hamiltonian.coefficients, hamiltonian.terms, strict=True
+        (coefficient, word.to_dense_string(n_qubits, big_endian=True))
+        for coefficient, word in zip(
+            hamiltonian.coefficients, hamiltonian.words, strict=True
         )
     ]
     pairs.append((hamiltonian.identity_coefficient, "I" * n_qubits))
@@ -79,7 +79,7 @@ def trotter_evolution(
     statevector; a controlled use inside QPE will need its own phase gate.
     """
     _, algorithms = load_cudaq()
-    width = hamiltonian.n_qubits if n_qubits is None else n_qubits
+    width = hamiltonian.num_qubits if n_qubits is None else n_qubits
     pairs = _pauli_pairs(hamiltonian, width)
     return algorithms.trotter.Trotter(
         pairs,
@@ -115,9 +115,11 @@ def qdrift_evolution(
         raise ValueError(msg)
 
     _, algorithms = load_cudaq()
-    width = hamiltonian.n_qubits if n_qubits is None else n_qubits
-    words = [term.to_str(width, big_endian=True) for term in hamiltonian.terms]
-    magnitude = hamiltonian.lam / reps
+    width = hamiltonian.num_qubits if n_qubits is None else n_qubits
+    words = [word.to_dense_string(width, big_endian=True) for word in hamiltonian.words]
+    # `lam` over the sampled (non-identity) terms only; the identity is carried as a
+    # separate coefficient below.
+    magnitude = sum(map(abs, hamiltonian.coefficients)) / reps
 
     pairs = [
         (copysign(magnitude, hamiltonian.coefficients[index]), words[index])
@@ -191,7 +193,7 @@ def qubitised_encoding(
     here, the constant shift is part of what gets block-encoded.
     """
     _, algorithms = load_cudaq()
-    width = hamiltonian.n_qubits if n_qubits is None else n_qubits
+    width = hamiltonian.num_qubits if n_qubits is None else n_qubits
     pairs = _pauli_pairs(hamiltonian, width)
     return algorithms.pauli_lcu.PauliLCU(
         pairs, num_qubits=width, coefficient_threshold=0.0
@@ -256,44 +258,46 @@ def qubitised_controlled_kernel(
 
 
 def simulation_kernel(
-    simulation: Trotter | QDRIFT | Qubitised,
+    simulation: Simulation,
+    hamiltonian: PauliSum,
+    time: float,
+    reps: int,
     *,
+    order: int = 2,
+    seed: Seed = None,
     n_qubits: int | None = None,
     state_prep: CudaqKernel | None = None,
 ) -> CudaqKernel:
     """
     Dispatch to the CUDA-Q Hamiltonian-simulation kernel for `simulation`.
 
-    The Hamiltonian, `time`, steps (`reps`), `order` and QDRIFT `seed` all come from
-    `simulation`. `Qubitised` has no time-evolution semantics to dispatch here - it
-    needs `qubitised_kernel`/`qubitised_controlled_kernel` directly, parametrized by a
-    walk power instead of `time`/`reps`; that case is checked before any CUDA-Q import
-    is attempted.
+    `order` is ignored for `Simulation.QDRIFT` (its product formula is
+    first-order by construction) and `seed` is ignored for `Simulation.Trotter`
+    (it is deterministic). `Simulation.Qubitised` has no time-evolution
+    semantics to dispatch here - it needs `qubitised_kernel`/
+    `qubitised_controlled_kernel` directly, parametrized by a walk power
+    instead of `time`/`reps`; that case is checked before any CUDA-Q import is
+    attempted.
     """
     match simulation:
-        case Trotter():
+        case Simulation.Trotter:
             return trotter_kernel(
-                simulation.hamiltonian,
-                simulation.time,
-                simulation.reps,
-                simulation.order,
-                n_qubits=n_qubits,
-                state_prep=state_prep,
+                hamiltonian, time, reps, order, n_qubits=n_qubits, state_prep=state_prep
             )
 
-        case QDRIFT():
+        case Simulation.QDRIFT:
             return qdrift_kernel(
-                simulation.hamiltonian,
-                simulation.time,
-                simulation.reps,
-                seed=simulation.seed,
+                hamiltonian,
+                time,
+                reps,
+                seed=seed,
                 n_qubits=n_qubits,
                 state_prep=state_prep,
             )
 
-        case Qubitised():
+        case Simulation.Qubitised:
             msg = (
-                "Qubitised simulation has no (time, reps) form in the CUDA-Q "
+                "Simulation.Qubitised has no (time, reps) form in the CUDA-Q "
                 "backend; use qubitised_kernel/qubitised_controlled_kernel directly."
             )
             raise NotImplementedError(msg)

@@ -24,7 +24,7 @@ def bitstring_kernel(bitstring: Sequence[int]) -> CudaqKernel:
     Build a CUDA-Q kernel preparing a computational basis state.
 
     `bitstring[i]` is the target value of qubit `i`, matching
-    `quiche.qualtran.bloqs.BitstringStatePrep` and QuEST's `initClassicalState`.
+    `quiche.resources.bloqs.BitstringStatePrep` and QuEST's `initClassicalState`.
     The returned kernel has signature `(data: cudaq.qview)` - `data` names the
     register consistently with `textbook_qpe_kernel`, which this kernel is
     meant to be composed with - and is injectable directly as the `state_prep=`
