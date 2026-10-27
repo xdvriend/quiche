@@ -1,0 +1,272 @@
+{
+    "Calculation_Info": {
+        "Charge": 0,
+        "Mult": 1,
+        "NumOfAtoms": 2,
+        "NumOfAuxCBasisFuncts": 0,
+        "NumOfAuxJBasisFuncts": 0,
+        "NumOfAuxJKBasisFuncts": 0,
+        "NumOfBasisFuncts": 2,
+        "NumOfCABSBasisFuncts": 0,
+        "NumOfElectrons": 2
+    },
+    "Calculation_Status": {
+        "Status": "NORMAL TERMINATION",
+        "progName": "ProgCAS",
+        "version": "6.1.1"
+    },
+    "Calculation_Timings": {
+        "CASSCF": 0.4044090000000001,
+        "GTOINT": 0.141936,
+        "PROP": 0.08014699999999997,
+        "PROPINT": 0.07018199999999997,
+        "SCF": 0.10400999999999999,
+        "SUM": 0.800684
+    },
+    "Geometries": [
+        {
+            "Dipole_Moment": [
+                {
+                    "Irrep": 0,
+                    "Level": "Relaxed density",
+                    "Method": "CASSCF",
+                    "Mult": 1,
+                    "State": 0,
+                    "dipoleElecContrib": [
+                        [
+                            0.0
+                        ],
+                        [
+                            0.0
+                        ],
+                        [
+                            0.0
+                        ]
+                    ],
+                    "dipoleMagnitude": 8.018452428223584e-16,
+                    "dipoleNucContrib": [
+                        [
+                            0.0
+                        ],
+                        [
+                            0.0
+                        ],
+                        [
+                            0.0
+                        ]
+                    ],
+                    "dipoleTotal": [
+                        [
+                            0.0
+                        ],
+                        [
+                            0.0
+                        ],
+                        [
+                            0.0
+                        ]
+                    ],
+                    "doAtomicDipole": false
+                }
+            ],
+            "Energy": [
+                {
+                    "Block": [
+                        [
+                            0
+                        ]
+                    ],
+                    "Method": "CASSCF",
+                    "Mult": [
+                        [
+                            1
+                        ]
+                    ],
+                    "NBlocks": 1,
+                    "NRoots": [
+                        [
+                            1
+                        ]
+                    ],
+                    "NTotalRoots": 1,
+                    "RelCorr": "None",
+                    "Root": [
+                        [
+                            0
+                        ]
+                    ],
+                    "finalEnergy": -1.1372744054909694,
+                    "numOfActiveEl": 2,
+                    "numOfActiveOrbs": 2,
+                    "numOfElectrons": 2,
+                    "numOfFCElectrons": 0,
+                    "totalEnergy": [
+                        [
+                            -1.1372744054909694
+                        ]
+                    ]
+                }
+            ],
+            "Geometry": {
+                "Coordinates": {
+                    "Cartesians": [
+                        [
+                            "H",
+                            0.0,
+                            0.0,
+                            0.0
+                        ],
+                        [
+                            "H",
+                            0.0,
+                            0.0,
+                            1.400287065236
+                        ]
+                    ],
+                    "Type": "Cartesians",
+                    "Units": "a.u."
+                },
+                "NAtoms": 2,
+                "NCorelessECP": 0,
+                "NGhostAtoms": 0
+            },
+            "Loewdin_Population_Analysis": [
+                {
+                    "ATNO": [
+                        [
+                            1
+                        ],
+                        [
+                            1
+                        ]
+                    ],
+                    "AtomicCharges": [
+                        [
+                            0.0
+                        ],
+                        [
+                            0.0
+                        ]
+                    ],
+                    "Irrep": 0,
+                    "Level": "Relaxed density",
+                    "Method": "CASSCF",
+                    "Mult": 1,
+                    "NAtoms": 2,
+                    "State": 0
+                }
+            ],
+            "Mayer_Population_Analysis": [
+                {
+                    "ATNO": [
+                        [
+                            1
+                        ],
+                        [
+                            1
+                        ]
+                    ],
+                    "BVA": [
+                        [
+                            0.9497994232170348
+                        ],
+                        [
+                            0.9497994232170348
+                        ]
+                    ],
+                    "BondOrders": [
+                        [
+                            0.9497994232170348
+                        ]
+                    ],
+                    "FA": [
+                        [
+                            0.05020057678296519
+                        ],
+                        [
+                            0.05020057678296519
+                        ]
+                    ],
+                    "Irrep": 0,
+                    "Level": "Relaxed density",
+                    "Method": "CASSCF",
+                    "Mult": 1,
+                    "NA": [
+                        [
+                            1.000000000000001
+                        ],
+                        [
+                            0.9999999999999996
+                        ]
+                    ],
+                    "NAtoms": 2,
+                    "NBondOrdersPrint": 1,
+                    "QA": [
+                        [
+                            0.0
+                        ],
+                        [
+                            0.0
+                        ]
+                    ],
+                    "State": 0,
+                    "VA": [
+                        [
+                            1.0
+                        ],
+                        [
+                            1.0
+                        ]
+                    ],
+                    "ZA": [
+                        [
+                            1.0
+                        ],
+                        [
+                            1.0
+                        ]
+                    ],
+                    "bondThresh": 0.1,
+                    "components": [
+                        [
+                            0,
+                            1,
+                            1,
+                            1
+                        ]
+                    ]
+                }
+            ],
+            "Mulliken_Population_Analysis": [
+                {
+                    "ATNO": [
+                        [
+                            1
+                        ],
+                        [
+                            1
+                        ]
+                    ],
+                    "AtomicCharges": [
+                        [
+                            0.0
+                        ],
+                        [
+                            0.0
+                        ]
+                    ],
+                    "Irrep": 0,
+                    "Level": "Relaxed density",
+                    "Method": "CASSCF",
+                    "Mult": 1,
+                    "NAtoms": 2,
+                    "State": 0
+                }
+            ],
+            "Single_Point_Data": {
+                "Converged": true,
+                "FinalEnergy": -1.1372744054909694
+            }
+        }
+    ]
+}
