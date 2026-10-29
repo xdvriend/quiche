@@ -14,6 +14,17 @@
 #   --refine=20         environment-tensor refinement sweeps (0 = skip refinement)
 #   --precision=fp64    fp64 | fp32 (compiler working precision)
 #   --seed=2026         random seed for the initial MPS
+#   --ms2=N             target 2S (= 2*M_S); defaults to MS2 from the FCIDUMP header
+#   --spin_penalty=0.0  spin-penalty strength mu in Ha (0 = off, the original behaviour)
+#
+# Spin targeting: the MPO has fermionic sites that conserve only the electron number, so
+# a plain DMRG finds the lowest state of *any* spin. With --spin_penalty=mu > 0 the DMRG
+# minimises H + P, with
+#
+#     P = mu * [ S^2 - S(S+1) + w (S_z - S)^2 ],   S = ms2/2,  w = 2S + 2,
+#
+# which vanishes exactly on the (S, M_S = S) states and is >= 2 mu on every other state
+# with the same electron number. The reported energy is <H>, without the penalty.
 #
 # Output protocol: everything chatty (DMRG / compiler progress) goes to STDERR.
 # STDOUT only contains `key=value` lines, one per line, with exactly one "=" each,
@@ -33,7 +44,7 @@ using Random
 
 const USAGE = "usage: julia --project=dmrg_env dmrg_circuit.jl INPUT.fcidump OUTPUT.json " *
               "[--maxdim=N] [--nsweeps=N] [--layers=N] [--tol=X] [--refine=N] " *
-              "[--precision=fp64|fp32] [--seed=N]"
+              "[--precision=fp64|fp32] [--seed=N] [--ms2=N] [--spin_penalty=X]"
 
 function parse_cli(args)
     positional = String[]
@@ -142,6 +153,81 @@ function normalise_fcidump(path::AbstractString)
 end
 
 # ------------------------------------------------------------------------------
+# Spin operators
+# ------------------------------------------------------------------------------
+#
+# fcidump_to_mpo uses interleaved Jordan-Wigner sites: site 2i-1 is spatial orbital i
+# with spin up (alpha), site 2i the same orbital with spin down (beta). Same-site
+# products are written out explicitly so every OpSum term acts on distinct sites.
+
+up(i) = 2i - 1
+dn(i) = 2i
+
+# c * S- S+ = c * sum_ij c†_{i dn} c_{i up} c†_{j up} c_{j dn}
+function add_sminus_splus!(os, norb, c)
+    for i in 1:norb, j in 1:norb
+        if i == j
+            ITensorMPS.add!(os, c, "n", dn(i))
+            ITensorMPS.add!(os, -c, "n", up(i), "n", dn(i))
+        else
+            ITensorMPS.add!(os, c, "c†", dn(i), "c", up(i), "c†", up(j), "c", dn(j))
+        end
+    end
+    return os
+end
+
+# c * Sz^2 = c/4 * sum_ij (n_{i up} - n_{i dn}) (n_{j up} - n_{j dn})
+function add_sz2!(os, norb, c)
+    for i in 1:norb, j in 1:norb
+        if i == j
+            ITensorMPS.add!(os, c / 4, "n", up(i))
+            ITensorMPS.add!(os, c / 4, "n", dn(i))
+            ITensorMPS.add!(os, -c / 2, "n", up(i), "n", dn(i))
+        else
+            ITensorMPS.add!(os, c / 4, "n", up(i), "n", up(j))
+            ITensorMPS.add!(os, c / 4, "n", dn(i), "n", dn(j))
+            ITensorMPS.add!(os, -c / 4, "n", up(i), "n", dn(j))
+            ITensorMPS.add!(os, -c / 4, "n", dn(i), "n", up(j))
+        end
+    end
+    return os
+end
+
+# c * Sz = c/2 * sum_i (n_{i up} - n_{i dn})
+function add_sz!(os, norb, c)
+    for i in 1:norb
+        ITensorMPS.add!(os, c / 2, "n", up(i))
+        ITensorMPS.add!(os, -c / 2, "n", dn(i))
+    end
+    return os
+end
+
+# S^2 = S- S+ + Sz^2 + Sz
+function s2_opsum(norb)
+    os = ITensors.OpSum()
+    add_sminus_splus!(os, norb, 1.0)
+    add_sz2!(os, norb, 1.0)
+    add_sz!(os, norb, 1.0)
+    return os
+end
+
+function sz_opsum(norb)
+    return add_sz!(ITensors.OpSum(), norb, 1.0)
+end
+
+# P = mu [S^2 - S(S+1) + w (Sz - S)^2]
+#   = mu S- S+ + mu (1 + w) Sz^2 + mu (1 - 2 w S) Sz + mu (w S^2 - S(S+1))
+function spin_penalty_opsum(norb, S, mu)
+    w = 2S + 2
+    os = ITensors.OpSum()
+    add_sminus_splus!(os, norb, mu)
+    add_sz2!(os, norb, mu * (1 + w))
+    add_sz!(os, norb, mu * (1 - 2w * S))
+    ITensorMPS.add!(os, mu * (w * S^2 - S * (S + 1)), "Id", 1)
+    return os
+end
+
+# ------------------------------------------------------------------------------
 # DMRG + circuit compilation
 # ------------------------------------------------------------------------------
 
@@ -173,6 +259,7 @@ function run_pipeline(input::String, output::String, opts)
     refine_iters = option(opts, "refine", 20)
     precision = Symbol(option(opts, "precision", "fp64"))
     seed = option(opts, "seed", 2026)
+    penalty = option(opts, "spin_penalty", 0.0)
 
     Random.seed!(seed)
 
@@ -184,9 +271,20 @@ function run_pipeline(input::String, output::String, opts)
         rm(tmp; force=true)
     end
 
-    # 2. DMRG ground state
+    target_ms2 = option(opts, "ms2", ms2)
+
+    # 2. DMRG ground state (in the requested spin state when the penalty is on)
     psi0 = ITensorMPS.random_mps(sites, init_state)
-    dmrg_energy, psi = ITensorMPS.dmrg(H, psi0, dmrg_schedule(nsweeps, maxdim); outputlevel=0)
+    sweeps = dmrg_schedule(nsweeps, maxdim)
+    if penalty > 0
+        P = ITensorMPS.MPO(spin_penalty_opsum(norb, target_ms2 / 2, penalty), sites)
+        _, psi = ITensorMPS.dmrg([H, P], psi0, sweeps; outputlevel=0)
+    else
+        _, psi = ITensorMPS.dmrg(H, psi0, sweeps; outputlevel=0)
+    end
+    dmrg_energy = real(ITensorMPS.inner(psi', H, psi))
+    s2 = real(ITensorMPS.inner(psi', ITensorMPS.MPO(s2_opsum(norb), sites), psi))
+    sz = real(ITensorMPS.inner(psi', ITensorMPS.MPO(sz_opsum(norb), sites), psi))
     chi = ITensorMPS.maxlinkdim(psi)
 
     # 3. MPS -> circuit (dense MPS: QN structure is not needed for compilation)
@@ -220,6 +318,10 @@ function run_pipeline(input::String, output::String, opts)
         "num_orbitals" => norb,
         "num_electrons" => nelec,
         "ms2" => ms2,
+        "target_ms2" => target_ms2,
+        "spin_penalty" => penalty,
+        "s2" => s2,
+        "sz" => sz,
         "num_qubits" => 2 * norb,
         "dmrg_energy" => dmrg_energy,
         "max_bond_dim" => chi,

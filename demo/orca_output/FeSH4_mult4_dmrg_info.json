@@ -1,0 +1,15 @@
+{
+  "num_orbitals": "5",
+  "num_electrons": "5",
+  "ms2": "3",
+  "target_ms2": "3",
+  "spin_penalty": "1.0",
+  "s2": "3.749999937868264",
+  "sz": "1.4999999746861827",
+  "num_qubits": "10",
+  "dmrg_energy": "-2854.2698959970667",
+  "max_bond_dim": "8",
+  "circuit_fidelity": "0.9996942269515154",
+  "refined_circuit_fidelity": "0.9999547363413762",
+  "circuit_file": "/data/home/xenov/Documents/quiche/demo/orca_output/FeSH4_mult4_dmrg_circuit.json"
+}
