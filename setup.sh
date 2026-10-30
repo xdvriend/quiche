@@ -17,8 +17,9 @@ trap "$on_error" ERR
 
 # Sets up the virtual environment for the QUICHE + CUDA-Q demos (demo/*.ipynb) in
 # ~/.venvs/quiche-cudaq: QUICHE from this repository (editable, with its CUDA-Q
-# extra), the ORCA Python interface and Jupyter, registered as an IPython kernel.
-# It can be run from any directory.
+# extra) and the demo with everything it needs (demo/pyproject.toml: the ORCA
+# Python interface, Open MPI, Plotly, Jupyter, ...), registered as an IPython
+# kernel. It can be run from any directory.
 #
 # Relies on createVirtualEnv / activateVirtualEnv / createIPyKernel being
 # defined in ~/.bashrc. Those definitions must sit ABOVE the terminal guard
@@ -28,7 +29,7 @@ trap "$on_error" ERR
 #   PYTHON_BIN=/path/to/python ./setup.sh  # interpreter to build the venv from (default: searched for, see below)
 #   KERNEL_NAME=my-kernel ./setup.sh   # Jupyter kernel name (default: cudaq-logical, as used by the notebooks)
 #   BASHRC=/path/to/.bashrc ./setup.sh # where the venv functions are defined (default: ~/.bashrc)
-#   WITHOUT_CUDAQ=1 ./setup.sh         # skip CUDA-Q (needed on Python >= 3.14, see below)
+#   WITHOUT_CUDAQ=1 ./setup.sh         # skip CUDA-Q, and with it the demo (needed on Python >= 3.14, see below)
 #   ./setup.sh run                     # start JupyterLab afterwards
 PYTHON_BIN="${PYTHON_BIN:-}"
 KERNEL_NAME="${KERNEL_NAME:-cudaq-logical}"
@@ -159,15 +160,16 @@ set -u
 python --version
 python -m pip install --upgrade pip
 
-# QUICHE from this repository, editable, with its CUDA-Q extra (cudaq, cudaq-algorithms).
+# QUICHE from this repository, editable, with its CUDA-Q extra (cudaq, cudaq-algorithms),
+# and the demo with its dependencies (demo/pyproject.toml), also editable. Both go in
+# one pip command: the demo depends on QUICHE, which isn't on PyPI, so pip has to see
+# the local QUICHE at the same time.
 if [ "$WITHOUT_CUDAQ" = "1" ]; then
-    pip install -e "$repo_root"
+    # The demo needs CUDA-Q, so without it only QUICHE (and Jupyter) is installed.
+    pip install -e "$repo_root" jupyterlab
 else
-    pip install -e "$repo_root[cudaq]"
+    pip install -e "$repo_root[cudaq]" -e "$repo_root/demo"
 fi
-
-# ORCA's Python interface (used to run ORCA from the notebooks) and Jupyter.
-pip install orca-pi jupyterlab
 
 # Registers the kernel and refuses if the venv above isn't actually active.
 createIPyKernel "$KERNEL_NAME"
@@ -175,6 +177,7 @@ createIPyKernel "$KERNEL_NAME"
 set +x
 echo "Jupyter and kernel are installed."
 echo "Use the '$KERNEL_NAME' kernel."
+echo "ORCA itself is not installed by this script; the demo expects it in ~/Software/orca-7.0.0-f.beta.4_linux_x86-64/bin."
 
 if [ "${1:-}" = "run" ]; then
     jupyter lab

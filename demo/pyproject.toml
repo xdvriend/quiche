@@ -1,0 +1,50 @@
+# The Fe(SH)4- QPE demo: everything the notebook (FeSH4_orca.ipynb), the batch scripts
+# (qpe_job.py, run_qpe.sh) and visualisation.py need.
+#
+# Install from the repository root, together with QUICHE (setup.sh does this):
+#     pip install -e ".[cudaq]" -e demo
+#
+# Not installable with pip, so not listed here:
+#   - ORCA itself (the notebook expects it in ~/Software/orca-7.0.0-f.beta.4_linux_x86-64/bin);
+#   - Julia, MPSCircuits.jl and dmrg_env/: only needed to recompute the DMRG guide states,
+#     which are pre-calculated in orca_output/.
+
+[project]
+name = "quiche-demo"
+version = "0.1.0"
+description = "Fe(SH)4- spin states with QPE: QUICHE and CUDA-Q on CPU and GPU."
+requires-python = ">=3.12, <3.14"  # QUICHE needs 3.12+; CUDA-Q 0.15 has no wheels for 3.14
+dependencies = [
+    # QUICHE with its CUDA-Q extra (cudaq 0.15, cudaq-algorithms; cuStateVec comes with cudaq).
+    # Not on PyPI: install it from this repository in the same pip command, as above.
+    "pyquiche[cudaq]",
+
+    # ORCA: its Python interface, and Open MPI for parallel ORCA runs. ORCA 7.0.0 beta 4 needs
+    # Open MPI 4.1.8 (5.0 fails at start-up); the PyPI wheels are Linux-only.
+    "orca-pi>=2.0",
+    "openmpi==4.1.8; sys_platform == 'linux'",
+
+    # Results and figures.
+    "numpy",
+    "pandas>=2.2",
+    "plotly>=5.8",   # 5.8+ for dotted grid lines (griddash)
+    "nbformat>=4.2", # lets Plotly show figures in notebooks
+    "ipython",       # display() of the centered figures and tables
+
+    # Jupyter, and running the notebook without a browser: jupyter nbconvert --execute.
+    "ipykernel",
+    "jupyterlab",
+    "nbconvert",
+]
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+# Make visualisation.py and statePrep/ importable from anywhere, not only from demo/.
+[tool.setuptools]
+py-modules = ["visualisation"]
+
+[tool.setuptools.packages.find]
+include = ["statePrep*"]
+namespaces = true  # statePrep/ has no __init__.py
