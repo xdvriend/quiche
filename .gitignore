@@ -51,7 +51,6 @@ demo/dmrg_mult6.py
 demo/**/rhf/
 demo/**/*_avas.out
 demo/**/*_avas.property.json
-!demo/**/dmrg_*.py
 demo/generated_kernel_module.py
 
 # Demo: outputs of QPE_error-longrun.ipynb, written next to the H2 geometry
