@@ -43,9 +43,9 @@ demo/**/*.json
 !demo/**/*_check.json
 !demo/**/*_rohf.json
 !demo/**/FeSH4.json
-demo/**/dmrg_mult2.py
-demo/**/dmrg_mult4.py
-demo/**/dmrg_mult6.py
+demo/dmrg_mult2.py
+demo/dmrg_mult4.py
+demo/dmrg_mult6.py
 
 # Demo: intermediate RHF/AVAS runs and generated CUDA-Q kernel modules
 demo/**/rhf/
