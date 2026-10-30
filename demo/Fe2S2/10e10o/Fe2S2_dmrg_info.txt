@@ -1,9 +1,0 @@
-num_orbitals=10
-num_electrons=10
-ms2=0
-num_qubits=20
-dmrg_energy=-5067.454518562266
-max_bond_dim=25
-circuit_fidelity=0.8360041770874687
-refined_circuit_fidelity=0.9934514736550808
-circuit_file=/Users/xeno.devriendt/Documents/Git/Forks/quiche/demo/Fe2S2/10e10o/Fe2S2_dmrg_circuit.json

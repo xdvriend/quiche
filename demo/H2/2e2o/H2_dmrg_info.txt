@@ -1,9 +1,0 @@
-num_orbitals=2
-num_electrons=2
-ms2=0
-num_qubits=4
-dmrg_energy=-1.1372744054909685
-max_bond_dim=2
-circuit_fidelity=0.9999999999999998
-refined_circuit_fidelity=0.9999999999999998
-circuit_file=/Users/xeno.devriendt/Documents/Git/Forks/quiche/demo/H2/2e2o/H2_dmrg_circuit.json
