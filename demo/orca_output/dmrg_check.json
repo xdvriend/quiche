@@ -1,21 +1,21 @@
 [
   {
     "multiplicity":2,
-    "energy_cudaq":-2854.1744173269,
+    "energy_cudaq":-2854.2135871516,
     "energy_dmrg":-2854.2136519646,
     "energy_fci":-2854.2136576211,
-    "hf_overlap":0.9266353694
+    "hf_overlap":0.9266481093
   },
   {
     "multiplicity":4,
-    "energy_cudaq":-2854.2468988721,
+    "energy_cudaq":-2854.2698837993,
     "energy_dmrg":-2854.2698959971,
     "energy_fci":-2854.2698994781,
-    "hf_overlap":0.9694056814
+    "hf_overlap":0.9694135103
   },
   {
     "multiplicity":6,
-    "energy_cudaq":-2854.3781943455,
+    "energy_cudaq":-2854.3781943454,
     "energy_dmrg":-2854.3781943454,
     "energy_fci":-2854.3781943454,
     "hf_overlap":1.0

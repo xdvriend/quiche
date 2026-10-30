@@ -1,7 +1,7 @@
 # The Fe(SH)4- QPE demo: everything the notebook (FeSH4_orca.ipynb), the batch scripts
 # (qpe_job.py, run_qpe.sh) and visualisation.py need.
 #
-# Install from the repository root, together with QUICHE (setup.sh does this):
+# Install from the repository root, together with QUICHE (setup-demo.sh does this):
 #     pip install -e ".[cudaq]" -e demo
 #
 # Not installable with pip, so not listed here:
@@ -19,10 +19,11 @@ dependencies = [
     # Not on PyPI: install it from this repository in the same pip command, as above.
     "pyquiche[cudaq]",
 
-    # ORCA: its Python interface, and Open MPI for parallel ORCA runs. ORCA 7.0.0 beta 4 needs
-    # Open MPI 4.1.8 (5.0 fails at start-up); the PyPI wheels are Linux-only.
+    # ORCA: its Python interface, and Open MPI for parallel ORCA runs (wheels for Linux and macOS).
+    # ORCA needs the Open MPI series it was built against: 4.1.8 works with ORCA 7.0.0 beta 4
+    # on Linux, where 5.0 fails at start-up.
     "orca-pi>=2.0",
-    "openmpi==4.1.8; sys_platform == 'linux'",
+    "openmpi==4.1.8",
 
     # Results and figures.
     "numpy",

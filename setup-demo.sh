@@ -1,59 +1,53 @@
 #!/usr/bin/env bash
 
-# Run this with `bash setup.sh`. Sourcing it would apply `set -e` and `exit` to
-# your own shell, which closes the terminal on the first error.
+# Sets up the virtual environment for the QUICHE + CUDA-Q demos (demo/*.ipynb):
+# QUICHE from this repository (editable, with its CUDA-Q extra) and the demo with
+# everything it needs (demo/pyproject.toml: the ORCA Python interface, Open MPI,
+# Plotly, Jupyter, ...), registered as a Jupyter kernel. It can be run from any
+# directory, and from any shell (bash, zsh, ...): it always runs under bash, and
+# doesn't use any functions or aliases from your shell configuration.
+#
+# Run it with:  bash setup-demo.sh   (or ./setup-demo.sh)
+#
+# Options (environment variables):
+#   PYTHON_BIN=/path/to/python bash setup-demo.sh  # interpreter to build the venv from (default: searched for, see below)
+#   VENV_HOME=/path/to/venvs bash setup-demo.sh    # where the venv is created (default: ~/.venvs)
+#   KERNEL_NAME=my-kernel bash setup-demo.sh       # Jupyter kernel name (default: cudaq-quiche, as used by the notebooks)
+#   WITHOUT_CUDAQ=1 bash setup-demo.sh             # skip CUDA-Q, and with it the demo (needed on Python >= 3.14, see below)
+#   bash setup-demo.sh run                         # start JupyterLab afterwards
+
+# Started with zsh or sh instead of bash (e.g. `zsh setup-demo.sh`)? Stop, with a
+# hint. Written in plain sh syntax, so that any shell can read it.
+if [ -z "${BASH_VERSION:-}" ]; then
+    echo "Run this script with bash: bash setup-demo.sh" >&2
+    return 1 2>/dev/null || exit 1
+fi
+
+# Sourcing it would apply `set -e` and `exit` to your own shell, which closes the
+# terminal on the first error.
 if [ "${BASH_SOURCE[0]}" != "$0" ]; then
     echo "Don't source this script; run it with: bash ${BASH_SOURCE[0]}" >&2
     return 1
 fi
 
+# Works with bash 3.2 too, the version macOS ships as /bin/bash.
 set -Eeuo pipefail
 
 # Keep a copy of all output, and say where it failed, so an error is never lost.
+script_name="$(basename "$0")"
 log="$HOME/quiche-setup.log"
 exec > >(tee "$log") 2>&1
-on_error='echo "setup.sh failed at line $LINENO: $BASH_COMMAND (full log: $log)" >&2'
+on_error='echo "$script_name failed at line $LINENO: $BASH_COMMAND (full log: $log)" >&2'
 trap "$on_error" ERR
 
-# Sets up the virtual environment for the QUICHE + CUDA-Q demos (demo/*.ipynb) in
-# ~/.venvs/quiche-cudaq: QUICHE from this repository (editable, with its CUDA-Q
-# extra) and the demo with everything it needs (demo/pyproject.toml: the ORCA
-# Python interface, Open MPI, Plotly, Jupyter, ...), registered as an IPython
-# kernel. It can be run from any directory.
-#
-# Relies on createVirtualEnv / activateVirtualEnv / createIPyKernel being
-# defined in ~/.bashrc. Those definitions must sit ABOVE the terminal guard
-# there, otherwise a non-interactive shell returns before reaching them.
-#
-# Options (environment variables):
-#   PYTHON_BIN=/path/to/python ./setup.sh  # interpreter to build the venv from (default: searched for, see below)
-#   KERNEL_NAME=my-kernel ./setup.sh   # Jupyter kernel name (default: cudaq-logical, as used by the notebooks)
-#   BASHRC=/path/to/.bashrc ./setup.sh # where the venv functions are defined (default: ~/.bashrc)
-#   WITHOUT_CUDAQ=1 ./setup.sh         # skip CUDA-Q, and with it the demo (needed on Python >= 3.14, see below)
-#   ./setup.sh run                     # start JupyterLab afterwards
 PYTHON_BIN="${PYTHON_BIN:-}"
-KERNEL_NAME="${KERNEL_NAME:-cudaq-logical}"
-BASHRC="${BASHRC:-$HOME/.bashrc}"
+VENV_HOME="${VENV_HOME:-$HOME/.venvs}"
+KERNEL_NAME="${KERNEL_NAME:-cudaq-quiche}"
 WITHOUT_CUDAQ="${WITHOUT_CUDAQ:-0}"
 
 env_name="quiche-cudaq"
+venv_dir="$VENV_HOME/$env_name"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-# bashrc isn't written for `set -eu`, so relax everything (and the error report)
-# while sourcing it.
-set +eux
-trap - ERR
-source "$BASHRC"
-trap "$on_error" ERR
-set -eu
-
-for fn in createVirtualEnv activateVirtualEnv createIPyKernel; do
-    if ! declare -F "$fn" >/dev/null; then
-        echo "Error: '$fn' is not defined after sourcing $BASHRC." >&2
-        echo "Move the venv functions above the terminal guard in $BASHRC." >&2
-        exit 1
-    fi
-done
 
 # Find a Python to build the venv from. It must be:
 #  - Python >= 3.12 (QUICHE), and < 3.14 unless WITHOUT_CUDAQ=1: CUDA-Q 0.15, the
@@ -122,12 +116,11 @@ fi
 echo "Using $python_bin ($("$python_bin" --version 2>&1))"
 
 # A venv from an earlier run may have been built on an incomplete Python.
-venv_python="$VENV_HOME/$env_name/bin/python"
-if [ -x "$venv_python" ]; then
-    problem="$(python_problem "$venv_python")"
+if [ -x "$venv_dir/bin/python" ]; then
+    problem="$(python_problem "$venv_dir/bin/python")"
     if [ -n "$problem" ]; then
-        echo "Error: the existing venv $VENV_HOME/$env_name was built on a $problem." >&2
-        echo "Remove it and run this script again: rm -rf $VENV_HOME/$env_name" >&2
+        echo "Error: the existing venv $venv_dir was built on a $problem." >&2
+        echo "Remove it and run this script again: rm -rf $venv_dir" >&2
         exit 1
     fi
 fi
@@ -145,17 +138,23 @@ fi
 
 set -x
 
-# Create the venv if it doesn't exist yet (createVirtualEnv refuses if it
-# does, so re-running this script just reuses it).
-if [ ! -d "$VENV_HOME/$env_name" ]; then
-    createVirtualEnv "$env_name" "$python_bin"
+# Create the venv if it doesn't exist yet; re-running this script reuses it.
+if [ ! -d "$venv_dir" ]; then
+    mkdir -p "$VENV_HOME"
+    "$python_bin" -m venv "$venv_dir"
 fi
 
 # venv's activate script can trip over `set -u` (e.g. an unset PS1 in a
 # non-interactive shell), so relax it just for the activation.
 set +u
-activateVirtualEnv "$env_name"
+source "$venv_dir/bin/activate"
 set -u
+
+# Make sure everything below really goes into the venv.
+if [ "$(python -c 'import os, sys; print(os.path.realpath(sys.prefix))')" != "$(cd "$venv_dir" && pwd -P)" ]; then
+    echo "Error: the venv $venv_dir is not active after activating it." >&2
+    exit 1
+fi
 
 python --version
 python -m pip install --upgrade pip
@@ -166,16 +165,17 @@ python -m pip install --upgrade pip
 # the local QUICHE at the same time.
 if [ "$WITHOUT_CUDAQ" = "1" ]; then
     # The demo needs CUDA-Q, so without it only QUICHE (and Jupyter) is installed.
-    pip install -e "$repo_root" jupyterlab
+    python -m pip install -e "$repo_root" jupyterlab
 else
-    pip install -e "$repo_root[cudaq]" -e "$repo_root/demo"
+    python -m pip install -e "$repo_root[cudaq]" -e "$repo_root/demo"
 fi
 
-# Registers the kernel and refuses if the venv above isn't actually active.
-createIPyKernel "$KERNEL_NAME"
+# Register the venv as a Jupyter kernel for the current user (replaces an existing
+# kernel of the same name).
+python -m ipykernel install --user --name "$KERNEL_NAME" --display-name "Python ($KERNEL_NAME)"
 
 set +x
-echo "Jupyter and kernel are installed."
+echo "Jupyter and kernel are installed in $venv_dir."
 echo "Use the '$KERNEL_NAME' kernel."
 echo "ORCA itself is not installed by this script; the demo expects it in ~/Software/orca-7.0.0-f.beta.4_linux_x86-64/bin."
 

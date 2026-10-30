@@ -18,6 +18,7 @@ import plotly.graph_objects as go
 from IPython.display import HTML, display
 from plotly.subplots import make_subplots
 
+PLOTLY_JS = True
 CHEM_ACC = 1.6e-3  # Ha
 
 # Backend labels, used as subplot titles and legend names.
