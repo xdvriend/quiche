@@ -1,0 +1,20 @@
+[
+  {
+    "multiplicity":2,
+    "spin":0.5,
+    "energy":-2854.2136576211,
+    "walltime_s":822.842428299
+  },
+  {
+    "multiplicity":4,
+    "spin":1.5,
+    "energy":-2854.2698994781,
+    "walltime_s":314.308870597
+  },
+  {
+    "multiplicity":6,
+    "spin":2.5,
+    "energy":-2854.3781943454,
+    "walltime_s":85.519571749
+  }
+]
